@@ -1,14 +1,6 @@
 #!/usr/bin/env python3
-# main.py - Full Forward Bot (python-telegram-bot v20.x)
-# Features:
-# - multi-admin (sqlite)
-# - auto-register chats when bot added
-# - auto-remove when bot removed
-# - channel -> groups forwarding
-# - admin-only broadcast (.sms command & private messages)
-# - logs & message delivery tracking
-# - reports and status commands
-# - keep-alive Flask server (for Replit/Uptime)
+# main.py - Full Forward Bot (clean, ordered)
+# Uses: python-telegram-bot v20.x, SQLite for persistence, Flask keep-alive
 
 import os
 import sqlite3
@@ -28,76 +20,48 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = os.getenv("8414051726:AAF6vcdJu2KSs67VBlZqj1F7QeNoPFzCMPc")  # set in Koyeb / Replit env
+BOT_TOKEN = os.getenv("8414051726:AAF6vcdJu2KSs67VBlZqj1F7QeNoPFzCMPc")  # set in env
 MAIN_ADMIN_ID = int(os.getenv("7149740820", "0"))  # set in env
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
-SEND_DELAY = float(os.getenv("SEND_DELAY", "0.6"))
+SEND_DELAY = float(os.getenv("SEND_DELAY", "0.6"))  # seconds between sends
 CHECK_ADMIN_BEFORE_SEND = os.getenv("CHECK_ADMIN_BEFORE_SEND", "False").lower() in ("1", "true", "yes")
+# ----------------------------------------
 
 if not BOT_TOKEN or MAIN_ADMIN_ID == 0:
     raise SystemExit("Please set BOT_TOKEN and MAIN_ADMIN_ID environment variables before running.")
 
+# logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ----------------- DB -----------------
+# ---------------- Database helpers ----------------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            added_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS chats (
-            chat_id TEXT PRIMARY KEY,
-            type TEXT,
-            title TEXT,
-            username TEXT,
-            added_by INTEGER,
-            added_at TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            msg_date TEXT,
-            from_user INTEGER,
-            from_chat_id TEXT,
-            message_id INTEGER,
-            content_type TEXT,
-            text_preview TEXT,
-            total_target INTEGER,
-            total_sent INTEGER,
-            total_failed INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS deliveries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message_row_id INTEGER,
-            target_chat_id TEXT,
-            status TEXT,
-            error TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS left_chats (
-            chat_id TEXT PRIMARY KEY,
-            title TEXT,
-            removed_at TEXT
-        )
-    """)
-    cur.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)", (MAIN_ADMIN_ID, datetime.utcnow().isoformat()))
+    cur.execute("""CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_at TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS chats (
+                    chat_id TEXT PRIMARY KEY, type TEXT, title TEXT, username TEXT, added_by INTEGER, added_at TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, msg_date TEXT, from_user INTEGER,
+                    from_chat_id TEXT, message_id INTEGER, content_type TEXT, text_preview TEXT,
+                    total_target INTEGER, total_sent INTEGER, total_failed INTEGER
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, message_row_id INTEGER, target_chat_id TEXT,
+                    status TEXT, error TEXT
+                   )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS left_chats (
+                    chat_id TEXT PRIMARY KEY, title TEXT, removed_at TEXT
+                   )""")
+    cur.execute("INSERT OR IGNORE INTO admins (user_id, added_at) VALUES (?, ?)", (MAIN_ADMIN_ID, now_iso()))
     conn.commit()
     conn.close()
 
 def now_iso():
     return datetime.utcnow().isoformat()
 
-# Admin helpers
+# Admin DB
 def add_admin_db(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -135,15 +99,14 @@ def is_admin(user_id: int) -> bool:
     conn.close()
     return ok
 
-# Chats helpers
+# Chats DB
 def add_chat_db(chat_id: str, ctype: str, title: str = "", username: str = "", added_by: Optional[int] = None) -> bool:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     try:
-        cur.execute("""
-            INSERT INTO chats (chat_id, type, title, username, added_by, added_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (str(chat_id), ctype, title or "", username or "", added_by, now_iso()))
+        cur.execute("""INSERT INTO chats (chat_id, type, title, username, added_by, added_at) 
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (str(chat_id), ctype, title or "", username or "", added_by, now_iso()))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -176,16 +139,16 @@ def log_left_chat(chat_id: str, title: str):
     conn.commit()
     conn.close()
 
-# Message logging
+# Message & delivery logging
 def create_message_row(msg: Message) -> int:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     content_type = detect_content_type(msg)
     preview = (msg.text or (getattr(msg, "caption", "") or ""))[:300]
-    cur.execute("""
-        INSERT INTO messages (msg_date, from_user, from_chat_id, message_id, content_type, text_preview, total_target, total_sent, total_failed)
-        VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-    """, (now_iso(), msg.from_user.id if msg.from_user else None, str(msg.chat_id), msg.message_id, content_type, preview))
+    cur.execute("""INSERT INTO messages 
+                   (msg_date, from_user, from_chat_id, message_id, content_type, text_preview, total_target, total_sent, total_failed)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)""",
+                (now_iso(), (msg.from_user.id if msg.from_user else None), str(msg.chat_id), msg.message_id, content_type, preview))
     row_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -194,21 +157,16 @@ def create_message_row(msg: Message) -> int:
 def update_message_counts(row_id: int, target_total: int, sent: int, failed: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE messages
-        SET total_target=?, total_sent=?, total_failed=?
-        WHERE id=?
-    """, (target_total, sent, failed, row_id))
+    cur.execute("UPDATE messages SET total_target=?, total_sent=?, total_failed=? WHERE id=?",
+                (target_total, sent, failed, row_id))
     conn.commit()
     conn.close()
 
 def add_delivery_record(message_row_id: int, target_chat_id: str, status: str, error: Optional[str] = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO deliveries (message_row_id, target_chat_id, status, error)
-        VALUES (?, ?, ?, ?)
-    """, (message_row_id, str(target_chat_id), status, error or ""))
+    cur.execute("INSERT INTO deliveries (message_row_id, target_chat_id, status, error) VALUES (?, ?, ?, ?)",
+                (message_row_id, str(target_chat_id), status, error or ""))
     conn.commit()
     conn.close()
 
@@ -271,7 +229,7 @@ async def broadcast_message_to_all(msg: Message, context: ContextTypes.DEFAULT_T
     update_message_counts(row_id, total, sent, failed)
     return {"row_id": row_id, "total": total, "sent": sent, "failed": failed}
 
-# ---------------- Handlers ----------------
+# ---------------- Handlers / Commands ----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Full Forward Bot running.\n"
@@ -362,12 +320,8 @@ def query_messages_by_date(query_date: str):
     cur = conn.cursor()
     start_iso = f"{query_date}T00:00:00"
     end_iso = f"{query_date}T23:59:59"
-    cur.execute("""
-        SELECT id, msg_date, content_type, text_preview, total_target, total_sent, total_failed
-        FROM messages
-        WHERE msg_date BETWEEN ? AND ?
-        ORDER BY id DESC
-    """, (start_iso, end_iso))
+    cur.execute("""SELECT id, msg_date, content_type, text_preview, total_target, total_sent, total_failed
+                   FROM messages WHERE msg_date BETWEEN ? AND ? ORDER BY id DESC""", (start_iso, end_iso))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -435,6 +389,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await broadcast_message_to_all(msg, context)
 
+# Chat member updates
 def extract_status_change(old: ChatMember, new: ChatMember) -> Optional[tuple]:
     try:
         old_status = old.status
@@ -525,13 +480,8 @@ def main():
 
     logger.info("Bot started — polling for updates...")
     app.run_polling(allowed_updates=[
-        "message",
-        "edited_message",
-        "channel_post",
-        "my_chat_member",
-        "chat_member",
+        "message", "edited_message", "channel_post", "my_chat_member", "chat_member"
     ])
-
 
 # ---------------- KEEP-ALIVE (Flask) ----------------
 from flask import Flask
@@ -551,7 +501,7 @@ def keep_alive():
     t.daemon = True
     t.start()
 
-# Start with keep-alive so Replit preview / Uptime works
+# Start
 if __name__ == "__main__":
     keep_alive()
     main()
